@@ -17,3 +17,4 @@ streamlit
 chromadb[grpc]==0.4.7
 python-multipart
 pysqlite3-binary
+psycopg2-binary
