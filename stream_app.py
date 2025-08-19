@@ -1,10 +1,19 @@
-# app.py
-
 import os
 import shutil
 import streamlit as st
 from datetime import datetime
 from typing import List, Optional
+
+# New Imports for Neon
+import psycopg2
+from langchain.vectorstores.pgvector import PGVector
+from langchain.document_loaders import PyPDFLoader, TextLoader, UnstructuredWordDocumentLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.chat_models import ChatOpenAI
+from langchain.chains import RetrievalQA
+from langchain.docstore.document import Document
+from langchain.prompts import PromptTemplate
 
 # --- Configuration Section ---
 # A4F API Configuration
@@ -15,10 +24,9 @@ A4F_BASE_URL = "https://api.a4f.co/v1"
 LLM_MODEL_NAME = "provider-3/gpt-4"
 EMBEDDING_MODEL_NAME = "provider-2/text-embedding-3-small"
 
-# ChromaDB Settings
-# Streamlit Cloud's file system is ephemeral, so we'll create these dirs
-CHROMA_DB_DIR = "chroma_db"
-COLLECTION_NAME = "pdf_documents"
+# Neon/Postgres Configuration
+CONNECTION_STRING = st.secrets["NEON_DB_URL"]
+COLLECTION_NAME = "pdf_documents_collection" 
 
 # Other Settings
 CHUNK_SIZE = 750
@@ -26,24 +34,14 @@ CHUNK_OVERLAP = 150
 UPLOAD_FOLDER = "docs"
 
 # --- Import & Environment Setup ---
-# The logic from all your files is now here, so we only need to import what's required for the whole app.
-from langchain.document_loaders import PyPDFLoader, TextLoader, UnstructuredWordDocumentLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Chroma
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.chat_models import ChatOpenAI
-from langchain.chains import RetrievalQA
-
-# Set up the API key and base URL from the config
 os.environ["OPENAI_API_KEY"] = A4F_API_KEY
 os.environ["OPENAI_API_BASE"] = A4F_BASE_URL
 
 # Ensure necessary directories exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(CHROMA_DB_DIR, exist_ok=True)
 
 
-# --- Core Logic Functions (from document_loader, embedding_store, qa_chain, retriever) ---
+# --- Core Logic Functions ---
 
 def get_embedding_function():
     return OpenAIEmbeddings(
@@ -54,35 +52,34 @@ def get_embedding_function():
 
 def get_vectorstore():
     embedding_function = get_embedding_function()
-    db = Chroma(
-        collection_name=COLLECTION_NAME,
+    db = PGVector(
+        connection_string=CONNECTION_STRING,
         embedding_function=embedding_function,
-        persist_directory=CHROMA_DB_DIR
+        collection_name=COLLECTION_NAME
     )
     return db
 
-def store_embeddings(documents, filename=None):
+def store_embeddings(documents: List[Document]):
+    """
+    Stores documents into the PGVector database.
+    LangChain's PGVector handles assigning the `metadata` to the `cmetadata` column.
+    """
     embedding_function = get_embedding_function()
-    db = Chroma(
+
+    PGVector.from_documents(
+        documents=documents,
+        embedding=embedding_function,
         collection_name=COLLECTION_NAME,
-        embedding_function=embedding_function,
-        persist_directory=CHROMA_DB_DIR
+        connection_string=CONNECTION_STRING
     )
-    if filename:
-        cleaned_filename = os.path.basename(filename)
-        for doc in documents:
-            doc.metadata["source"] = cleaned_filename
-            doc.metadata["upload_date"] = datetime.now().strftime("%Y-%m-%d")
-            print(f"📦 Metadata for doc: {doc.metadata}")
 
-    db.add_documents(documents)
-    db.persist()
-    return db
-
-def load_documents_from_folder(folder_path, metadata=None):
+def load_documents_from_folder(folder_path: str, metadata: Optional[dict] = None) -> List[Document]:
+    """Loads documents from the specified folder, assigning metadata."""
     all_documents = []
     for file_name in os.listdir(folder_path):
         file_path = os.path.join(folder_path, file_name)
+        
+        # Determine the correct loader based on file extension
         if file_name.lower().endswith(".pdf"):
             loader = PyPDFLoader(file_path)
         elif file_name.lower().endswith(".txt"):
@@ -91,6 +88,8 @@ def load_documents_from_folder(folder_path, metadata=None):
             loader = UnstructuredWordDocumentLoader(file_path)
         else:
             continue
+        
+        # Load and update document metadata
         documents = loader.load()
         for doc in documents:
             doc.metadata["source"] = file_name
@@ -100,7 +99,28 @@ def load_documents_from_folder(folder_path, metadata=None):
         all_documents.extend(documents)
     return all_documents
 
-def split_documents(documents):
+def clean_documents(documents: List[Document]) -> List[Document]:
+    """Removes NUL (0x00) characters from document content and metadata values."""
+    cleaned_docs = []
+    for doc in documents:
+        # Clean the document's main content
+        if doc.page_content:
+            doc.page_content = doc.page_content.replace('\x00', '')
+        
+        # Clean the metadata values
+        cleaned_metadata = {}
+        if doc.metadata:
+            for key, value in doc.metadata.items():
+                if isinstance(value, str):
+                    cleaned_metadata[key] = value.replace('\x00', '')
+                else:
+                    cleaned_metadata[key] = value
+        
+        doc.metadata = cleaned_metadata
+        cleaned_docs.append(doc)
+    return cleaned_docs
+
+def split_documents(documents: List[Document]) -> List[Document]:
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP
@@ -122,7 +142,7 @@ def get_retriever(source_file: str = None):
     )
     return retriever
 
-def get_qa_chain(source_file=None):
+def get_qa_chain(source_file: Optional[str] = None):
     retriever = get_retriever(source_file)
     llm = ChatOpenAI(
         openai_api_key=A4F_API_KEY,
@@ -139,28 +159,67 @@ def get_qa_chain(source_file=None):
     return qa_chain
 
 def get_all_metadata():
-    db = get_vectorstore()
-    results = db.get(include=["metadatas"])
-    files = {}
-    for metadata in results["metadatas"]:
-        file = metadata.get("source", "Unknown")
-        date = metadata.get("upload_date", "Unknown")
-        files[file] = date
-    return [{"file": f, "upload_date": d} for f, d in files.items()]
+    """Fetches metadata from the `cmetadata` column, which is where LangChain stores it."""
+    conn = None
+    cur = None
+    try:
+        conn = psycopg2.connect(CONNECTION_STRING)
+        cur = conn.cursor()
+        
+        # Check if the table exists before querying it
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM pg_tables
+                WHERE schemaname = 'public' AND tablename = 'langchain_pg_embedding'
+            );
+        """)
+        table_exists = cur.fetchone()[0]
 
+        if not table_exists:
+            return []
+
+        # If the table exists, proceed with the query
+        cur.execute("SELECT DISTINCT cmetadata->>'source', cmetadata->>'upload_date' FROM langchain_pg_embedding;")
+        results = cur.fetchall()
+        
+        files = {}
+        for row in results:
+            file = row[0] if row[0] is not None else "Unknown"
+            date = row[1] if row[1] is not None else "Unknown"
+            files[file] = date
+        return [{"file": f, "upload_date": d} for f, d in files.items()]
+
+    except Exception as e:
+        st.error(f"⚠️ Error in get_all_metadata: {e}")
+        return []
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+            
 def clear_all_data():
+    """Deletes all local files and drops the database table."""
     # 1. Delete all files from docs/
     for filename in os.listdir(UPLOAD_FOLDER):
         file_path = os.path.join(UPLOAD_FOLDER, filename)
         if os.path.isfile(file_path):
             os.remove(file_path)
-    # 2. Delete all embeddings from vectorstore (by recreating empty one)
-    db = get_vectorstore()
-    db.delete_collection()
 
+    # 2. Delete all embeddings from Neon by dropping the table
+    try:
+        conn = psycopg2.connect(CONNECTION_STRING)
+        conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+        cursor = conn.cursor()
+        # Drop the default table name created by PGVector
+        cursor.execute("DROP TABLE IF EXISTS langchain_pg_embedding;")
+        cursor.close()
+        conn.close()
+        st.success("✅ All data and embeddings cleared successfully.")
+    except Exception as e:
+        st.error(f"⚠️ Error while clearing data: {e}")
 
 # --- Streamlit UI Functions ---
-# These functions will now call the core logic directly.
 def process_uploaded_files(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile]):
     """Saves and processes files for ingestion."""
     if not uploaded_files:
@@ -178,14 +237,14 @@ def process_uploaded_files(uploaded_files: List[st.runtime.uploaded_file_manager
 
         # Ingest documents
         docs = load_documents_from_folder(UPLOAD_FOLDER)
-        chunks = split_documents(docs)
+        cleaned_docs = clean_documents(docs)  # Clean the documents
+        chunks = split_documents(cleaned_docs)
         store_embeddings(chunks)
 
     st.success(f"✅ Files processed and knowledge base updated! Added: {', '.join(uploaded_filenames)}")
 
 def answer_questions(questions: List[str], selected_file: str):
     """Retrieves answers for a list of questions."""
-    # Convert 'All Documents' to None for the retriever filter
     source_file_filter = None if selected_file == "All Documents" else selected_file
 
     with st.spinner("🚀 Getting answers..."):
