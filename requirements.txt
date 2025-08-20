@@ -15,6 +15,6 @@ python-multipart
 requests
 streamlit
 chromadb[grpc]==0.4.7
-python-multipart
-pysqlite3-binary
+# Add the correct PostgreSQL driver here
+psycopg2-binary
 pgvector
