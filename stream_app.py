@@ -21,7 +21,7 @@ A4F_API_KEY = "ddc-a4f-67b11dc36daf4f128b78e5b126b62966"
 A4F_BASE_URL = "https://api.a4f.co/v1"
 
 # Model Names
-LLM_MODEL_NAME = "provider-1/qwen2.5-coder-3b-instruct"
+LLM_MODEL_NAME = "provider-3/gpt-5-nano"
 EMBEDDING_MODEL_NAME = "provider-6/qwen3-embedding-4b"
 
 # Neon/Postgres Configuration
